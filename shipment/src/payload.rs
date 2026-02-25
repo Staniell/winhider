@@ -5,35 +5,29 @@
  *
  * Filename: payload.rs
  * Author: bigwiz
- * Description: Dynamic link library (DLL) payload shipment for WinHider that performs
- *              low-level window manipulation operations. Injected into target
- *              processes to hide/show windows from screen capture and taskbar.
+ * Description: Dynamic link library (DLL) payload for WinHider that performs
+ *              window display affinity manipulation. Loaded into target
+ *              processes via SetWindowsHookEx to hide/show windows from screen capture.
  *
- * Features:
- * - DLL injection mechanism
- * - Window style manipulation
- * - Extended window style control
- * - Process-specific operations
- * - Thread-safe execution
- *
- * Technical Details:
- * - Uses Windows API for window manipulation
- * - Implements DllMain entry point
- * - Supports multiple injection actions
- * - Error handling and logging
+ * Action Communication:
+ *   The injector creates a named shared memory region "WinHider_Action_{pid}"
+ *   containing 16 bytes:
+ *     Bytes 0-7: target HWND (isize) — the specific window to modify
+ *     Byte 8:    action bitmask:
+ *       1 = Hide from capture (WDA_EXCLUDEFROMCAPTURE)
+ *       2 = Show in capture (WDA_NONE)
  *
  * Created: 2024
  * License: Proprietary - Bitmutex Technologies
  * =============================================================================
  */
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
+use windows::Win32::System::Memory::*;
 use windows::Win32::System::SystemServices::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
-
-static mut DLL_INSTANCE: HINSTANCE = HINSTANCE(0);
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[unsafe(no_mangle)]
 #[allow(non_snake_case, unused_variables)]
@@ -44,7 +38,6 @@ pub extern "system" fn DllMain(
 ) -> BOOL {
     match call_reason {
         DLL_PROCESS_ATTACH => {
-            unsafe { DLL_INSTANCE = dll_module; }
             std::thread::spawn(|| {
                 unsafe { apply_stealth(); }
             });
@@ -54,65 +47,54 @@ pub extern "system" fn DllMain(
     BOOL(1)
 }
 
-unsafe fn apply_stealth() {
-    // 1. Parse Filename to determine actions
-    let mut path_buffer = [0u16; 1024];
-    let len = GetModuleFileNameW(DLL_INSTANCE, &mut path_buffer);
-    let full_path = String::from_utf16_lossy(&path_buffer[..len as usize]).to_lowercase();
-    
-    // We use a bitmask to pass instructions to the enumeration callback
-    // Bit 0: Hide Capture
-    // Bit 1: Show Capture
-    // Bit 2: Hide Taskbar
-    // Bit 3: Show Taskbar
-    let mut action_mask: isize = 0;
-
-    if full_path.contains("hidecapture") { action_mask |= 1; }
-    if full_path.contains("showcapture") { action_mask |= 2; }
-    if full_path.contains("hidetaskbar") { action_mask |= 4; }
-    if full_path.contains("showtaskbar") { action_mask |= 8; }
-
-    let current_pid = GetCurrentProcessId();
-    EnumWindows(Some(enum_window_proc), LPARAM(action_mask));
+/// Exported hook procedure for SetWindowsHookEx-based DLL loading.
+/// Simply forwards the call to the next hook in the chain.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn HookProc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-unsafe extern "system" fn enum_window_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let mask = lparam.0;
-    let mut window_pid = 0;
-    let current_pid = GetCurrentProcessId();
-    GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+unsafe fn apply_stealth() {
+    unsafe {
+        let current_pid = GetCurrentProcessId();
 
-    // Only modify windows belonging to THIS process
-    if window_pid == current_pid && IsWindowVisible(hwnd).as_bool() {
-        
-        // --- 1. Screen Capture Protection ---
-        if (mask & 1) != 0 { 
-            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE); 
-        }
-        if (mask & 2) != 0 { 
-            let _ = SetWindowDisplayAffinity(hwnd, WDA_NONE); 
-        }
+        // Read target HWND + action from named shared memory
+        let map_name = format!("WinHider_Action_{}\0", current_pid);
+        let wide_name: Vec<u16> = map_name.encode_utf16().collect();
 
-        // --- 2. Taskbar / Alt-Tab Visibility ---
-        // To hide from Taskbar: Remove APPWINDOW, Add TOOLWINDOW
-        if (mask & 4) != 0 {
-            let mut style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            style &= !WS_EX_APPWINDOW.0;
-            style |= WS_EX_TOOLWINDOW.0;
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
-            // Trigger a frame redraw to apply changes
-            SetWindowPos(hwnd, HWND(0), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        let mapping = OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(wide_name.as_ptr()));
+        let mapping = match mapping {
+            Ok(m) => m,
+            Err(_) => return, // No shared memory found — nothing to do
+        };
+
+        const SHARED_MEM_SIZE: usize = 16;
+        let view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, SHARED_MEM_SIZE);
+        if view.Value.is_null() {
+            let _ = CloseHandle(mapping);
+            return;
         }
 
-        // To show in Taskbar: Remove TOOLWINDOW, Add APPWINDOW
-        if (mask & 8) != 0 {
-            let mut style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            style &= !WS_EX_TOOLWINDOW.0;
-            style |= WS_EX_APPWINDOW.0;
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
-            SetWindowPos(hwnd, HWND(0), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        // Read target HWND (bytes 0-7) and action mask (byte 8)
+        let ptr = view.Value as *const u8;
+        let mut hwnd_bytes = [0u8; 8];
+        std::ptr::copy_nonoverlapping(ptr, hwnd_bytes.as_mut_ptr(), 8);
+        let target_hwnd = HWND(isize::from_ne_bytes(hwnd_bytes));
+        let action_mask = *ptr.add(8);
+
+        let _ = UnmapViewOfFile(view);
+        let _ = CloseHandle(mapping);
+
+        if action_mask == 0 {
+            return;
+        }
+
+        // Apply action to the specific target window only
+        if (action_mask & 1) != 0 {
+            let _ = SetWindowDisplayAffinity(target_hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+        if (action_mask & 2) != 0 {
+            let _ = SetWindowDisplayAffinity(target_hwnd, WDA_NONE);
         }
     }
-    
-    BOOL(1)
 }

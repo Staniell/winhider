@@ -11,8 +11,7 @@
 ;
 ; Key Operations:
 ; - Defines application metadata (Name, Version, Publisher)
-; - Detects system architecture (x64/x86) to launch correct executable
-; - Installs main executable, payload DLLs, and version files
+; - Installs 64-bit executables and payload DLL
 ; - Configures Start Menu and Desktop shortcuts
 ; - Sets up modern wizard style with custom banner assets
 ;
@@ -22,30 +21,29 @@
 
 #define MyAppName "WinHider"
 #define MyCLIAppName "WinHider CLI"
-#define MyAppVersion "1.0.7"
 #define MyAppPublisher "Bitmutex Technologies"
 #define MyAppURL "https://github.com/aamitn/winhider"
 
+; Read version from appver.txt (generated at build time from git tag)
+#define MyAppVersion ReadIni(SourcePath + "\..\appver.txt", "", "", "1.0.7")
+
 [Code]
-
-// GUI App Name  
-function MyAppExeName(Param: String): String;
+function GetAppVersion(Param: String): String;
+var
+  VersionFile: String;
+  Lines: TArrayOfString;
 begin
-  if IsWin64 then 
-    Result := 'winhider.exe'
-  else 
-    Result := 'winhider_32bit.exe';
+  VersionFile := ExpandConstant('{src}\appver.txt');
+  if FileExists(VersionFile) then
+  begin
+    if LoadStringsFromFile(VersionFile, Lines) and (GetArrayLength(Lines) > 0) then
+    begin
+      Result := Trim(Lines[0]);
+      Exit;
+    end;
+  end;
+  Result := '{#MyAppVersion}';
 end;
-
-// CLI App Name  
-function MyCLIAppExeName(Param: String): String;
-begin
-  if IsWin64 then 
-    Result := 'winhider-cli.exe'
-  else 
-    Result := 'winhider-cli_32bit.exe';
-end;
-
 
 [Setup]
 ; Wizard Pages
@@ -58,7 +56,7 @@ WizardImageFile=.\installer_assets\banner.bmp
 ; (To generate a new GUID, click Tools | Generate GUID inside the IDE.)
 AppId={{4896775D-F364-4AF8-AD6C-946EE5F49D95}
 ;SignTool=winsdk_signtool
-AppName={#MyAppName} 
+AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -74,10 +72,11 @@ OutputBaseFilename=WinhiderInstaller
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-; Custom install options
-ArchitecturesInstallIn64BitMode=x64compatible 
+; x64 only — no 32-bit support
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=whicon.ico
-UninstallDisplayIcon={app}\{code:MyAppExeName}
+UninstallDisplayIcon={app}\winhider.exe
 UninstallDisplayName={#MyAppName}
 
 [Languages]
@@ -86,29 +85,29 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
-[Files]   
+[Files]
 Source: "..\target\x86_64-pc-windows-msvc\release\*.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\x86_64-pc-windows-msvc\release\winhider_payload.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\appver.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; GUI APP
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{code:MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{code:MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\winhider.exe"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\winhider.exe"; Tasks: desktopicon
 ; CLI APP
-Name: "{autoprograms}\{#MyCLIAppName}"; Filename: "{app}\{code:MyCLIAppExeName}"
-Name: "{autodesktop}\{#MyCLIAppName}"; Filename: "{app}\{code:MyCLIAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyCLIAppName}"; Filename: "{app}\winhider-cli.exe"
+Name: "{autodesktop}\{#MyCLIAppName}"; Filename: "{app}\winhider-cli.exe"; Tasks: desktopicon
 
 [Run]
 ;Run GUI APP
-Filename: "{app}\{code:MyAppExeName}"; \
-Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}™ GUI}"; \
+Filename: "{app}\winhider.exe"; \
+Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')} GUI}"; \
 Flags: nowait postinstall skipifsilent unchecked shellexec; \
 WorkingDir: "{app}"
 
 ;Run CLI APP
-Filename: "{app}\{code:MyCLIAppExeName}"; \
-Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}™ CLI}"; \
+Filename: "{app}\winhider-cli.exe"; \
+Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')} CLI}"; \
 Flags: nowait postinstall skipifsilent unchecked shellexec; \
 WorkingDir: "{app}"
 

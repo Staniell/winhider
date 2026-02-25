@@ -1,4 +1,4 @@
-name: Build Release Deploy App 
+name: Build Release Deploy App
 
 on:
   push:
@@ -15,7 +15,7 @@ permissions:
   contents: write # for auto-release
   pages: write # for GitHub Pages deployment
   id-token: write
-  
+
 env:
   #BUILD_PATH: "." # default value when not using subfolders
   ASTRO_BUILD_PATH: site
@@ -31,30 +31,66 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # setup-msbuild with dtolnay/rust-toolchain
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-          # If you also need 32-bit support (like your old x86 build), add: i686-pc-windows-msvc
 
-      # msbuild with cargo build
       - name: Build Project
         run: cargo build --release --target x86_64-pc-windows-msvc
-          
+
+      - name: Generate appver.txt from git tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $env:GITHUB_REF -replace '^refs/tags/', ''
+            $version | Out-File -FilePath appver.txt -NoNewline -Encoding utf8
+          } else {
+            "v0.0.0-dev" | Out-File -FilePath appver.txt -NoNewline -Encoding utf8
+          }
+          Write-Host "Version: $(Get-Content appver.txt)"
+
+      - name: Decode signing certificate
+        shell: pwsh
+        run: |
+          $certBytes = [Convert]::FromBase64String("${{ secrets.WINHIDER_CERT_BASE64 }}")
+          [IO.File]::WriteAllBytes("${{ github.workspace }}\Misc\BitmutexCert.pfx", $certBytes)
+
       - name: Sign Release Binaries
         shell: cmd
         run: sign.cmd -p "${{ secrets.WINHIDER_CERT_SIGN_PASSWORD }}"
 
       - name: Generate zip bundle
-        run: 7z a -tzip Winhider.zip .\appver.txt .\target\x86_64-pc-windows-msvc\release\*.dll .\target\x86_64-pc-windows-msvc\release\*.exe
+        shell: pwsh
+        run: |
+          if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) {
+            Write-Error "7-Zip not found on PATH"
+            exit 1
+          }
+          7z a -tzip Winhider.zip .\appver.txt .\target\x86_64-pc-windows-msvc\release\*.dll .\target\x86_64-pc-windows-msvc\release\*.exe
+
+      - name: Verify Inno Setup available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            Write-Error "Inno Setup (iscc) not found on PATH"
+            exit 1
+          }
 
       - name: Build Installer
         run: iscc .\Misc\inno.iss
-        
+
       - name: Sign Installer
         shell: cmd
         run: sign.cmd -i -p "${{ secrets.WINHIDER_CERT_SIGN_PASSWORD }}"
+
+      - name: Clean up certificate
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "${{ github.workspace }}\Misc\BitmutexCert.pfx") {
+            Remove-Item "${{ github.workspace }}\Misc\BitmutexCert.pfx" -Force
+          }
 
       - name: Set release name
         id: release_name
@@ -78,7 +114,7 @@ jobs:
             Winhider.zip
             Misc/Output/WinhiderInstaller.exe
 
-      - name: Publish tagged release 
+      - name: Publish tagged release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:

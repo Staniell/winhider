@@ -1,6 +1,10 @@
 # IMPORTANT Except allow the specific file tasks.vs.json
 !.vs/tasks.vs.json
 
+# Security: Never commit certificates or signing tools
+*.pfx
+Misc/signtool.exe
+
 Misc/Output/
 target/
 dist/

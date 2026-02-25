@@ -30,31 +30,20 @@
  */
 
 use clap::{Parser, Subcommand};
-use std::ffi::c_void;
-use std::time::{SystemTime, UNIX_EPOCH};
-use windows::core::{s};
 use windows::Win32::Foundation::*;
-use windows::Win32::System::Diagnostics::Debug::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
-use windows::Win32::Graphics::Gdi::*;
+
+use winhider_core::{
+    clean_temp_files, inject_payload, set_taskbar_visibility_external, InjectionAction,
+    IGNORED_WINDOWS,
+};
 
 // ===============================
 // CONSTANTS & CONFIG
 // ===============================
 
 const APP_NAME: &str = "WinHider CLI";
-
-// Windows to ignore in the list
-const IGNORED_WINDOWS: &[&str] = &[
-    "Program Manager",
-    "Settings",
-    "Microsoft Text Input Application",
-    "WinHider"
-];
 
 // ===============================
 // Data Models
@@ -70,20 +59,13 @@ struct WindowInfo {
     pub is_visible: bool,
 }
 
-enum InjectionAction {
-    HideCapture,
-    ShowCapture,
-    HideTaskbar,
-    ShowTaskbar,
-}
-
 // ===============================
 // CLI Commands
 // ===============================
 
 #[derive(Parser)]
 #[command(name = APP_NAME)]
-#[command(version = "1.0.1")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Headless window visibility controller - runs in interactive mode by default")]
 struct Cli {
     #[command(subcommand)]
@@ -212,89 +194,6 @@ fn get_window_by_id(id_str: &str) -> Option<WindowInfo> {
     windows.into_iter().find(|w| w.title.to_lowercase().contains(&id_str.to_lowercase()))
 }
 
-fn inject_payload(target_pid: u32, action: InjectionAction) -> std::result::Result<String, String> {
-    unsafe {
-        let mut master_dll_path = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .unwrap()
-            .join("winhider_payload.dll");
-
-        if !master_dll_path.exists() {
-             if let Ok(cwd) = std::env::current_dir() {
-                 master_dll_path = cwd.join("target").join("release").join("winhider_payload.dll");
-             }
-        }
-        if !master_dll_path.exists() { return Err("Base DLL not found. Make sure winhider_payload.dll is in the same directory.".to_string()); }
-
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-        let keyword = match action {
-            InjectionAction::HideCapture => "hidecapture",
-            InjectionAction::ShowCapture => "showcapture",
-            InjectionAction::HideTaskbar => "hidetaskbar",
-            InjectionAction::ShowTaskbar => "showtaskbar",
-        };
-
-        let new_filename = format!("winhider_payload_{}_{}.dll", keyword, timestamp);
-        let target_dll_path = master_dll_path.parent().unwrap().join(&new_filename);
-
-        if let Err(e) = std::fs::copy(&master_dll_path, &target_dll_path) {
-            return Err(format!("Failed to create temp DLL: {}", e));
-        }
-
-        let path_str = target_dll_path.to_str().unwrap();
-        let mut path_bytes: Vec<u8> = path_str.bytes().collect();
-        path_bytes.push(0);
-
-        let process = OpenProcess(
-            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-            false,
-            target_pid
-        ).map_err(|e| format!("OpenProcess failed: {}", e))?;
-
-        let remote_mem = VirtualAllocEx(process, None, path_bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote_mem.is_null() { let _ = CloseHandle(process); return Err("Memory allocation failed".to_string()); }
-
-        let mut written = 0;
-        let write_res = WriteProcessMemory(process, remote_mem, path_bytes.as_ptr() as *const c_void, path_bytes.len(), Some(&mut written));
-        if write_res.is_err() { let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE); let _ = CloseHandle(process); return Err("WriteProcessMemory failed".to_string()); }
-
-        let kernel32 = GetModuleHandleA(s!("kernel32.dll")).unwrap();
-        let load_lib = GetProcAddress(kernel32, s!("LoadLibraryA"));
-
-        if load_lib.is_none() { let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE); let _ = CloseHandle(process); return Err("GetProcAddress failed".to_string()); }
-
-        let start_routine = std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(*mut c_void) -> u32>(std::mem::transmute(load_lib));
-
-        let thread = CreateRemoteThread(process, None, 0, Some(start_routine), Some(remote_mem), 0, None)
-            .map_err(|e| format!("CreateRemoteThread failed: {}", e))?;
-
-        WaitForSingleObject(thread, 2000);
-        let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
-        let _ = CloseHandle(thread);
-        let _ = CloseHandle(process);
-
-        Ok(new_filename)
-    }
-}
-
-fn clean_temp_files() {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("winhider_payload_") && name.ends_with(".dll") {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn get_window_details(hwnd: HWND) -> Option<(String, String, RECT, u32)> {
     unsafe {
         let mut title_buf = [0u16; 256];
@@ -384,7 +283,7 @@ fn handle_list() {
 fn handle_hide(window_id: &str) {
     match get_window_by_id(window_id) {
         Some(window) => {
-            match inject_payload(window.pid, InjectionAction::HideCapture) {
+            match inject_payload(window.hwnd, InjectionAction::HideCapture) {
                 Ok(_) => println!("Successfully hid window '{}' from screen capture.", window.title),
                 Err(e) => println!("Error hiding window: {}", e),
             }
@@ -396,7 +295,7 @@ fn handle_hide(window_id: &str) {
 fn handle_unhide(window_id: &str) {
     match get_window_by_id(window_id) {
         Some(window) => {
-            match inject_payload(window.pid, InjectionAction::ShowCapture) {
+            match inject_payload(window.hwnd, InjectionAction::ShowCapture) {
                 Ok(_) => println!("Successfully unhid window '{}' from screen capture.", window.title),
                 Err(e) => println!("Error unhiding window: {}", e),
             }
@@ -408,7 +307,7 @@ fn handle_unhide(window_id: &str) {
 fn handle_hidetask(window_id: &str) {
     match get_window_by_id(window_id) {
         Some(window) => {
-            match inject_payload(window.pid, InjectionAction::HideTaskbar) {
+            match set_taskbar_visibility_external(window.hwnd, true) {
                 Ok(_) => println!("Successfully hid window '{}' from taskbar.", window.title),
                 Err(e) => println!("Error hiding window from taskbar: {}", e),
             }
@@ -420,7 +319,7 @@ fn handle_hidetask(window_id: &str) {
 fn handle_unhidetask(window_id: &str) {
     match get_window_by_id(window_id) {
         Some(window) => {
-            match inject_payload(window.pid, InjectionAction::ShowTaskbar) {
+            match set_taskbar_visibility_external(window.hwnd, false) {
                 Ok(_) => println!("Successfully unhid window '{}' from taskbar.", window.title),
                 Err(e) => println!("Error unhiding window from taskbar: {}", e),
             }

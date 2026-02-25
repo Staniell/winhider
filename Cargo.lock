@@ -4684,7 +4684,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winhider"
-version = "1.0.1"
+version = "1.0.7"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -4697,21 +4697,30 @@ dependencies = [
  "ureq",
  "windows 0.52.0",
  "windows-capture",
+ "winhider-core",
  "winres",
 ]
 
 [[package]]
 name = "winhider-cli"
-version = "1.0.1"
+version = "1.0.7"
 dependencies = [
  "clap",
  "windows 0.52.0",
+ "winhider-core",
  "winres",
 ]
 
 [[package]]
+name = "winhider-core"
+version = "1.0.7"
+dependencies = [
+ "windows 0.52.0",
+]
+
+[[package]]
 name = "winhider_payload"
-version = "1.0.1"
+version = "1.0.7"
 dependencies = [
  "windows 0.52.0",
 ]

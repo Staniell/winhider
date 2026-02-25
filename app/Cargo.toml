@@ -1,6 +1,6 @@
 [package]
 name = "winhider"
-version = "1.0.1"
+version = "1.0.7"
 edition = "2024"
 
 [build-dependencies]
@@ -10,13 +10,14 @@ winres = "0.1"
 eframe = "0.27"
 raw-window-handle = "0.6"
 egui_extras = { version = "0.27", features = ["all_loaders"] }
-image = { version = "0.24", features = ["default"] } 
-windows-capture = "1.0.52" 
+image = { version = "0.24", features = ["default"] }
+windows-capture = "1.0.52"
 crossbeam-channel = "0.5"
 ureq = { version = "2.9", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = "0.4"
+winhider-core = { path = "../core" }
 
 [dependencies.windows]
 version = "0.52"

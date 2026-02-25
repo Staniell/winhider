@@ -1,18 +1,16 @@
 [package]
-name = "winhider_payload"
+name = "winhider-core"
 version = "1.0.7"
 edition = "2024"
-
-[lib]
-path = "src/payload.rs"
-crate-type = ["cdylib"] # IMPORTANT: Compiles to DLL
 
 [dependencies.windows]
 version = "0.52"
 features = [
     "Win32_Foundation",
-    "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
     "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security",
 ]

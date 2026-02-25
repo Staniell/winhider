@@ -1,6 +1,6 @@
 [package]
 name = "winhider-cli"
-version = "1.0.1"
+version = "1.0.7"
 edition = "2024"
 
 [build-dependencies]
@@ -21,3 +21,4 @@ windows = { version = "0.52", features = [
     "Win32_System_ProcessStatus",
 ] }
 clap = { version = "4.0", features = ["derive"] }
+winhider-core = { path = "../core" }

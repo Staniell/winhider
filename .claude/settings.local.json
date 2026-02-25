@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__exa__get_code_context_exa",
+      "Bash(find C:\\\\Users\\\\giost\\\\OneDrive\\\\Desktop\\\\Personal\\\\winhider:*)",
+      "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && cargo check --target x86_64-pc-windows-msvc 2>&1)",
+      "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && git rm \"Misc/BitmutexCert.pfx\" \"Misc/signtool.exe\" 2>&1)",
+      "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && cargo build --release --target x86_64-pc-windows-msvc 2>&1)",
+      "Bash(ls:*)"
+    ]
+  }
+}

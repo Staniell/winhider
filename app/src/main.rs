@@ -27,21 +27,19 @@
 
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::ffi::c_void; 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::ffi::c_void;
+use std::time::{Duration, SystemTime};
 use std::path::PathBuf;
 use std::env;
-use chrono::Datelike; 
+use chrono::Datelike;
 
-use windows::core::{s};
 use windows::Win32::Foundation::*;
-use windows::Win32::System::Diagnostics::Debug::*;
-use windows::Win32::System::LibraryLoader::*;
-use windows::Win32::System::Memory::*;
-use windows::Win32::System::Threading::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::System::Diagnostics::ToolHelp::*;
 use windows::Win32::Graphics::Gdi::*;
+
+use winhider_core::{
+    clean_temp_files, inject_payload, set_taskbar_visibility_external, InjectionAction,
+};
 
 // WGC Imports
 use windows_capture::{
@@ -66,13 +64,6 @@ const VERSION_FILE: &str = "appver.txt";
 const USER_AGENT: &str = "WinHider-App";
 
 
-// Windows to ignore in the list
-pub const IGNORED_WINDOWS: &[&str] = &[
-    "Program Manager", 
-    "Settings", 
-    "Microsoft Text Input Application",
-    "WinHider"
-];
 
 
 // ===============================
@@ -88,13 +79,6 @@ struct AppSettings {
 
 fn default_preview_quality() -> u32 {
     2  // Default: Medium quality (scale factor 2)
-}
-
-enum InjectionAction {
-    HideCapture,
-    ShowCapture,
-    HideTaskbar,
-    ShowTaskbar,
 }
 
 #[derive(Clone, PartialEq)]
@@ -388,9 +372,8 @@ impl eframe::App for WinHiderApp {
                         if self.should_auto_hide(&w.title) {
                             w.is_taskbar_hidden = true;
                             w.is_capture_hidden = true;
-                            let pid = get_pid(w.hwnd);
-                            let _ = inject_payload(pid, InjectionAction::HideTaskbar);
-                            let _ = inject_payload(pid, InjectionAction::HideCapture);
+                            let _ = set_taskbar_visibility_external(w.hwnd, true);
+                            let _ = inject_payload(w.hwnd, InjectionAction::HideCapture);
                         }
                     }
                     merged.push(w);
@@ -439,13 +422,12 @@ impl eframe::App for WinHiderApp {
                 let mut success_count = 0;
                 for &selected_hwnd in &self.selected_window_idx {
                     if let Some(window) = self.windows.iter_mut().find(|w| w.hwnd == selected_hwnd) {
-                        let pid = get_pid(window.hwnd);
-                        let action = if window.is_capture_hidden { 
-                            InjectionAction::ShowCapture 
-                        } else { 
-                            InjectionAction::HideCapture 
+                        let action = if window.is_capture_hidden {
+                            InjectionAction::ShowCapture
+                        } else {
+                            InjectionAction::HideCapture
                         };
-                        if let Ok(_) = inject_payload(pid, action) {
+                        if inject_payload(window.hwnd, action).is_ok() {
                             window.is_capture_hidden = !window.is_capture_hidden;
                             success_count += 1;
                         }
@@ -466,14 +448,9 @@ impl eframe::App for WinHiderApp {
                 let mut success_count = 0;
                 for &selected_hwnd in &self.selected_window_idx {
                     if let Some(window) = self.windows.iter_mut().find(|w| w.hwnd == selected_hwnd) {
-                        let pid = get_pid(window.hwnd);
-                        let action = if window.is_taskbar_hidden { 
-                            InjectionAction::ShowTaskbar 
-                        } else { 
-                            InjectionAction::HideTaskbar 
-                        };
-                        if let Ok(_) = inject_payload(pid, action) {
-                            window.is_taskbar_hidden = !window.is_taskbar_hidden;
+                        let hide = !window.is_taskbar_hidden;
+                        if set_taskbar_visibility_external(window.hwnd, hide).is_ok() {
+                            window.is_taskbar_hidden = hide;
                             success_count += 1;
                         }
                     }
@@ -732,13 +709,7 @@ impl eframe::App for WinHiderApp {
 
                             ui.horizontal(|ui| {
                                 if ui.checkbox(&mut window.is_taskbar_hidden, "Hide Taskbar").changed() {
-                                    let pid = get_pid(window.hwnd);
-                                    let action = if window.is_taskbar_hidden { 
-                                        InjectionAction::HideTaskbar 
-                                    } else { 
-                                        InjectionAction::ShowTaskbar 
-                                    };
-                                    if let Err(e) = inject_payload(pid, action) {
+                                    if let Err(e) = set_taskbar_visibility_external(window.hwnd, window.is_taskbar_hidden) {
                                         self.status_msg = format!("Error: {}", e);
                                         window.is_taskbar_hidden = !window.is_taskbar_hidden;
                                     }
@@ -747,13 +718,12 @@ impl eframe::App for WinHiderApp {
                                 ui.separator();
 
                                 if ui.checkbox(&mut window.is_capture_hidden, "Hide Capture").changed() {
-                                    let pid = get_pid(window.hwnd);
                                     let action = if window.is_capture_hidden {
                                         InjectionAction::HideCapture
                                     } else {
                                         InjectionAction::ShowCapture
                                     };
-                                    match inject_payload(pid, action) {
+                                    match inject_payload(window.hwnd, action) {
                                         Ok(_) => self.status_msg = format!("Capture state updated: {}", window.title),
                                         Err(e) => {
                                             self.status_msg = format!("Error: {}", e);
@@ -1102,116 +1072,6 @@ fn get_window_icon(hwnd: HWND, _ctx: &egui::Context) -> Option<egui::TextureHand
     }
 }
 
-#[allow(unused_must_use)]
-fn inject_payload(target_pid: u32, action: InjectionAction) -> std::result::Result<String, String> {
-    unsafe {
-        let mut master_dll_path = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .unwrap()
-            .join("winhider_payload.dll");
-        
-        if !master_dll_path.exists() {
-             if let Ok(cwd) = std::env::current_dir() {
-                 master_dll_path = cwd.join("target").join("release").join("winhider_payload.dll");
-             }
-        }
-        if !master_dll_path.exists() { return Err("Base DLL not found".to_string()); }
-
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-        let keyword = match action {
-            InjectionAction::HideCapture => "hidecapture",
-            InjectionAction::ShowCapture => "showcapture",
-            InjectionAction::HideTaskbar => "hidetaskbar",
-            InjectionAction::ShowTaskbar => "showtaskbar",
-        };
-
-        let new_filename = format!("winhider_payload_{}_{}.dll", keyword, timestamp);
-        let target_dll_path = master_dll_path.parent().unwrap().join(&new_filename);
-
-        if let Err(e) = std::fs::copy(&master_dll_path, &target_dll_path) {
-            return Err(format!("Failed to create temp DLL: {}", e));
-        }
-
-        let path_str = target_dll_path.to_str().unwrap();
-        let mut path_bytes: Vec<u8> = path_str.bytes().collect();
-        path_bytes.push(0); 
-
-        let process = OpenProcess(
-            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
-            false,
-            target_pid
-        ).map_err(|e| format!("OpenProcess failed: {}", e))?;
-
-        let remote_mem = VirtualAllocEx(process, None, path_bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if remote_mem.is_null() { let _ = CloseHandle(process); return Err("Alloc fail".to_string()); }
-
-        let mut written = 0;
-        let write_res = WriteProcessMemory(process, remote_mem, path_bytes.as_ptr() as *const c_void, path_bytes.len(), Some(&mut written));
-        if write_res.is_err() { let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE); let _ = CloseHandle(process); return Err("Write fail".to_string()); }
-
-        let kernel32 = GetModuleHandleA(s!("kernel32.dll")).unwrap();
-        let load_lib = GetProcAddress(kernel32, s!("LoadLibraryA"));
-        
-        if load_lib.is_none() { let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE); let _ = CloseHandle(process); return Err("No LoadLibraryA".to_string()); }
-
-        let start_routine = std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "system" fn(*mut c_void) -> u32>(std::mem::transmute(load_lib));
-
-        let thread = CreateRemoteThread(process, None, 0, Some(start_routine), Some(remote_mem), 0, None)
-            .map_err(|e| format!("Thread fail: {}", e))?;
-
-        WaitForSingleObject(thread, 2000);
-        let _ = VirtualFreeEx(process, remote_mem, 0, MEM_RELEASE);
-        let _ = CloseHandle(thread);
-        let _ = CloseHandle(process);
-
-        Ok(new_filename)
-    }
-}
-
-fn kill_process_by_name(name: &str) {
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok();
-        if let Some(snapshot) = snapshot {
-            let mut entry = PROCESSENTRY32 { dwSize: std::mem::size_of::<PROCESSENTRY32>() as u32, ..Default::default() };
-            if Process32First(snapshot, &mut entry).is_ok() {
-                loop {
-                    let exe_file = &entry.szExeFile;
-                    let len = exe_file.iter().position(|&c| c == 0).unwrap_or(exe_file.len());
-                    let process_name = String::from_utf8_lossy(&exe_file[0..len].iter().map(|&c| c as u8).collect::<Vec<u8>>()).into_owned();
-
-                    if process_name.eq_ignore_ascii_case(name) {
-                        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
-                            let _ = TerminateProcess(h, 1);
-                            let _ = CloseHandle(h);
-                        }
-                    }
-                    if Process32Next(snapshot, &mut entry).is_err() { break; }
-                }
-            }
-            let _ = CloseHandle(snapshot);
-        }
-    }
-}
-
-fn clean_temp_files() {
-    kill_process_by_name("ApplicationFrameHost.exe");
-    std::thread::sleep(Duration::from_millis(500));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with("winhider_payload_") && name.ends_with(".dll") {
-                            let _ = std::fs::remove_file(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 fn launch_cli() -> Result<(), String> {
     let exe_path = std::env::current_exe()
@@ -1300,27 +1160,10 @@ pub fn load_app_icon() -> (egui::IconData, egui::ColorImage) {
     }
 }
 
-fn get_pid(hwnd: HWND) -> u32 {
-    let mut pid = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
-    pid
-}
-
 fn set_capture_self(hwnd: HWND, hide: bool) -> std::result::Result<(), String> {
     unsafe {
         let affinity = if hide { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
         SetWindowDisplayAffinity(hwnd, affinity).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-fn set_taskbar_visibility_external(hwnd: HWND, hide: bool) -> std::result::Result<(), String> {
-    unsafe {
-        let mut style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-        if hide { style &= !WS_EX_APPWINDOW.0; style |= WS_EX_TOOLWINDOW.0; } 
-        else { style &= !WS_EX_TOOLWINDOW.0; style |= WS_EX_APPWINDOW.0; }
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style as isize);
-        SetWindowPos(hwnd, HWND(0), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1334,37 +1177,37 @@ fn get_eframe_hwnd(frame: &eframe::Frame) -> HWND {
 
 // In your win32 module
 pub fn enumerate_windows(ctx: &egui::Context) -> Vec<AppWindow> {
-    let mut list = Vec::new();
+    let list = Vec::new();
     let mut params = (list, ctx.clone());
-    
+
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
-        
-        let mut title_buf = [0u16; 256];
-        let len = GetWindowTextW(hwnd, &mut title_buf);
-        if len == 0 { return BOOL(1); }
-        
-        let title = String::from_utf16_lossy(&title_buf[..len as usize]);
-        if crate::IGNORED_WINDOWS.contains(&title.as_str()) { return BOOL(1); }
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() { return BOOL(1); }
 
-        // --- NEW: Get PID ---
-        let mut pid = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        // --------------------
+            let mut title_buf = [0u16; 256];
+            let len = GetWindowTextW(hwnd, &mut title_buf);
+            if len == 0 { return BOOL(1); }
 
-        let (list, ctx) = &mut *(lparam.0 as *mut (Vec<AppWindow>, egui::Context));
-        list.push(AppWindow { 
-            hwnd, 
-            pid, // Store it
-            title, 
-            is_taskbar_hidden: false, 
-            is_capture_hidden: false, 
-            icon_texture: get_window_icon(hwnd, ctx) 
-        });
-        BOOL(1)
+            let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+            if winhider_core::IGNORED_WINDOWS.contains(&title.as_str()) { return BOOL(1); }
+
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+            let (list, ctx) = &mut *(lparam.0 as *mut (Vec<AppWindow>, egui::Context));
+            list.push(AppWindow {
+                hwnd,
+                pid,
+                title,
+                is_taskbar_hidden: false,
+                is_capture_hidden: false,
+                icon_texture: get_window_icon(hwnd, ctx)
+            });
+            BOOL(1)
+        }
     }
 
-    unsafe { EnumWindows(Some(enum_proc), LPARAM(&mut params as *mut _ as isize)); }
+    unsafe { let _ = EnumWindows(Some(enum_proc), LPARAM(&mut params as *mut _ as isize)); }
     params.0
 }
 

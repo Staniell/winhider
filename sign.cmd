@@ -2,19 +2,19 @@ echo.
 echo.  Use --help/-h for help
 @echo off
 setlocal
-REM Use --pass "<yourpass>" or -p "<yourpass>" for custom password - USE QUOTES
+REM Use --pass "<yourpass>" or -p "<yourpass>" for password (REQUIRED)
 REM Use --signinstaller or -i to sign installer(s) ONLY (Misc\output\*.exe)
 REM Use --signall or -a to sign installer(s) BOTH (Misc\output\*.exe) and (Build\bin\Release\*.exe)
-REM For no arguments it signs (Build\bin\Release\*.exe) with default password
+REM For no arguments it signs (Build\bin\Release\*.exe)
 REM Example : sign --signall --pass mypassword
 
 REM Change to the directory where the script is located
 cd /d "%~dp0"
 
-REM Path to signtool and certificate (relative to script location)
-set "SIGNTOOL=Misc\signtool.exe"
+REM Path to certificate (relative to script location)
+set "SIGNTOOL=signtool.exe"
 set "CERT=Misc\BitmutexCert.pfx"
-set "PASSWORD=mysecurepass"  REM Default password
+set "PASSWORD="
 
 REM Directories
 set "TARGET_DIR=target\x86_64-pc-windows-msvc\release"
@@ -71,8 +71,15 @@ goto parse_args
 
 :done_parse
 
-REM Timestamp server
-set "TIMESTAMP=http://timestamp.comodoca.com/authenticode"
+REM Validate password is provided
+if "%PASSWORD%"=="" (
+    echo ERROR: Password is required. Use --pass "<yourpass>" or -p "<yourpass>"
+    echo Run sign.cmd --help for usage information.
+    EXIT /B 1
+)
+
+REM Timestamp server (HTTPS)
+set "TIMESTAMP=https://timestamp.comodoca.com/authenticode"
 
 if "%SIGN_ALL%"=="1" (
     echo Signing all files in both %TARGET_DIR% and %INSTALLER_DIR%...
@@ -113,11 +120,11 @@ EXIT /B %errorlevel%
 :show_help
 echo.
 echo Usage:
-echo   --pass "<yourpass>" or -p "<yourpass>"     Uses custom password (quotes required) and sign Release Files at (Build\bin\Release\*.exe)
+echo   --pass "<yourpass>" or -p "<yourpass>"     Password for certificate (REQUIRED)
 echo   --signinstaller or -i                      Sign installer(s) ONLY (Misc\output\*.exe)
-echo   --signall or -a                            Sign both installers and release files at (Misc\output\*.exe and Build\bin\Release\*.exe)
+echo   --signall or -a                            Sign both installers and release files
 echo   --help or -h                               Show this help message and exit
 echo.
-echo   No arguments:                              Signs release files (Build\bin\Release\*.exe and .dll) with default password
+echo   Password is REQUIRED for all signing operations.
 echo.
 exit /b 0
