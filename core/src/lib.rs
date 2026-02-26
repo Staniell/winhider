@@ -64,6 +64,15 @@ pub fn set_taskbar_visibility_external(hwnd: HWND, hide: bool) -> Result<(), Str
     Ok(())
 }
 
+pub fn set_always_on_top(hwnd: HWND, topmost: bool) -> Result<(), String> {
+    unsafe {
+        let z = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        SetWindowPos(hwnd, z, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Injects the payload DLL into the target process using SetWindowsHookEx
 /// with action communication via named shared memory.
 ///

@@ -6,7 +6,18 @@
       "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && cargo check --target x86_64-pc-windows-msvc 2>&1)",
       "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && git rm \"Misc/BitmutexCert.pfx\" \"Misc/signtool.exe\" 2>&1)",
       "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && cargo build --release --target x86_64-pc-windows-msvc 2>&1)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cd:*)",
+      "Bash(gh auth:*)",
+      "Bash(git config:*)",
+      "Bash(echo \"protocol=https\nhost=github.com\" | gh auth git-credential get 2>&1)",
+      "Bash(printf \"protocol=https\\\\nhost=github.com\\\\n\" | git credential fill 2>&1)",
+      "Bash(gh repo:*)",
+      "Bash(gh api:*)",
+      "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && git remote rename origin upstream && git remote add origin https://github.com/Staniell/winhider.git 2>&1)",
+      "Bash(cd \"C:/Users/giost/OneDrive/Desktop/Personal/winhider\" && git push -u origin refactor/core-lib-and-per-window-injection 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\giost\\\\OneDrive\\\\Desktop\\\\Personal\\\\winhider\" && cargo build --release --target x86_64-pc-windows-msvc 2>&1)",
+      "Bash(git add:*)"
     ]
   }
 }

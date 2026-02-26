@@ -38,8 +38,13 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Graphics::Gdi::*;
 
 use winhider_core::{
-    clean_temp_files, inject_payload, set_taskbar_visibility_external, InjectionAction,
+    clean_temp_files, inject_payload, set_always_on_top, set_taskbar_visibility_external,
+    InjectionAction,
 };
+
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
+use windows::Win32::System::Com::{CoInitializeEx, CoCreateInstance, COINIT_APARTMENTTHREADED, CLSCTX_INPROC_SERVER};
+use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 
 // WGC Imports
 use windows_capture::{
@@ -75,10 +80,22 @@ struct AppSettings {
     enable_auto_update: bool,
     #[serde(default = "default_preview_quality")]
     preview_quality: u32,
+    #[serde(default = "default_hotkey_enabled")]
+    global_hotkey_enabled: bool,
+    #[serde(default = "default_hotkey_vk")]
+    global_hotkey_vk: u32,
 }
 
 fn default_preview_quality() -> u32 {
     2  // Default: Medium quality (scale factor 2)
+}
+
+fn default_hotkey_enabled() -> bool {
+    true
+}
+
+fn default_hotkey_vk() -> u32 {
+    0xC0 // VK_OEM_3 = backtick key
 }
 
 #[derive(Clone, PartialEq)]
@@ -93,10 +110,11 @@ enum UpdateStatus {
 #[derive(Clone)]
 pub struct AppWindow {
     pub hwnd: HWND,
-    pub pid: u32, 
+    pub pid: u32,
     pub title: String,
     pub is_taskbar_hidden: bool,
-    pub is_capture_hidden: bool, 
+    pub is_capture_hidden: bool,
+    pub is_always_on_top: bool,
     pub icon_texture: Option<egui::TextureHandle>,
 }
 
@@ -168,6 +186,35 @@ impl GraphicsCaptureApiHandler for WgcHandler {
 }
 
 // ===============================
+// STEALTH FOCUS STATE
+// ===============================
+
+struct StealthFocusState {
+    /// Last foreground window that was NOT capture-hidden
+    cover_hwnd: HWND,
+    /// Whether a capture-hidden window is currently foreground
+    active: bool,
+    /// Frame counter for heartbeat (re-send every 30 frames)
+    heartbeat_counter: u32,
+    /// COM ITaskbarList, initialized lazily
+    taskbar_list: Option<ITaskbarList>,
+}
+
+impl StealthFocusState {
+    fn get_taskbar_list(&mut self) -> Option<&ITaskbarList> {
+        if self.taskbar_list.is_none() {
+            unsafe {
+                if let Ok(tbl) = CoCreateInstance::<_, ITaskbarList>(&TaskbarList, None, CLSCTX_INPROC_SERVER) {
+                    let _ = tbl.HrInit();
+                    self.taskbar_list = Some(tbl);
+                }
+            }
+        }
+        self.taskbar_list.as_ref()
+    }
+}
+
+// ===============================
 // MAIN APP STATE
 // ===============================
 
@@ -201,6 +248,18 @@ struct WinHiderApp {
 
     // Settings
     enable_auto_update: bool,
+    global_hotkey_enabled: bool,
+    global_hotkey_vk: u32,
+
+    // Self always-on-top (one-shot)
+    self_topmost_applied: bool,
+
+    // Stealth focus
+    stealth_focus: StealthFocusState,
+
+    // Global Hotkey
+    hotkey_receiver: crossbeam_channel::Receiver<()>,
+    hotkey_shutdown_sender: Option<crossbeam_channel::Sender<()>>,
 
     // Communication Channels
     capture_control: Option<CaptureControl<WgcHandler, Box<dyn std::error::Error + Send + Sync>>>,
@@ -237,18 +296,28 @@ impl WinHiderApp {
         let app_icon_texture = Some(cc.egui_ctx.load_texture("app_icon", color_image, egui::TextureOptions::LINEAR));
 
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let (up_tx, up_rx) = crossbeam_channel::unbounded(); 
+        let (up_tx, up_rx) = crossbeam_channel::unbounded();
         let monitors = Monitor::enumerate().unwrap_or_default();
+
+        // Set up global hotkey channel
+        let (hk_tx, hk_rx) = crossbeam_channel::bounded(1);
+        let hotkey_shutdown = if settings.global_hotkey_enabled {
+            let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+            start_hotkey_thread(settings.global_hotkey_vk, hk_tx.clone(), shutdown_rx);
+            Some(shutdown_tx)
+        } else {
+            None
+        };
 
         let mut app = Self {
             app_version,
-            app_icon_texture, // Store texture
+            app_icon_texture,
             self_hide_capture: false,
             self_hide_taskbar: false,
             windows: Vec::new(),
             status_msg: "Ready.".to_string(),
             last_refresh: SystemTime::UNIX_EPOCH,
-            
+
             monitors,
             selected_monitor_idx: 0,
             show_preview: true,
@@ -263,11 +332,24 @@ impl WinHiderApp {
             new_app_input: String::new(),
             selected_window_idx: Vec::new(),
             enable_auto_update: settings.enable_auto_update,
-            
+            global_hotkey_enabled: settings.global_hotkey_enabled,
+            global_hotkey_vk: settings.global_hotkey_vk,
+
+            self_topmost_applied: false,
+            stealth_focus: StealthFocusState {
+                cover_hwnd: HWND(0),
+                active: false,
+                heartbeat_counter: 0,
+                taskbar_list: None,
+            },
+
+            hotkey_receiver: hk_rx,
+            hotkey_shutdown_sender: hotkey_shutdown,
+
             capture_control: None,
             frame_receiver: rx,
             frame_sender: tx,
-            
+
             update_sender: up_tx,
             update_receiver: up_rx,
         };
@@ -350,6 +432,43 @@ impl WinHiderApp {
     }
 }
 
+fn start_hotkey_thread(
+    vk: u32,
+    hotkey_sender: crossbeam_channel::Sender<()>,
+    shutdown_receiver: crossbeam_channel::Receiver<()>,
+) {
+    std::thread::spawn(move || unsafe {
+        const HOTKEY_ID: i32 = 1;
+        let _ = RegisterHotKey(HWND(0), HOTKEY_ID, HOT_KEY_MODIFIERS(0), vk);
+
+        loop {
+            // Check for shutdown signal
+            if shutdown_receiver.try_recv().is_ok() {
+                break;
+            }
+
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, HWND(0), 0, 0, PM_REMOVE).into() {
+                if msg.message == WM_HOTKEY {
+                    let _ = hotkey_sender.try_send(());
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let _ = UnregisterHotKey(HWND(0), HOTKEY_ID);
+    });
+}
+
+impl Drop for WinHiderApp {
+    fn drop(&mut self) {
+        // Signal hotkey thread to shut down
+        if let Some(sender) = self.hotkey_shutdown_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 // ===============================
 // egui App
 // ===============================
@@ -357,6 +476,36 @@ impl WinHiderApp {
 impl eframe::App for WinHiderApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let self_hwnd = get_eframe_hwnd(frame);
+
+        // --- One-shot: make WinHider always-on-top ---
+        if !self.self_topmost_applied {
+            let _ = set_always_on_top(self_hwnd, true);
+            // Initialize cover_hwnd to the current foreground if it's not ourselves
+            let fg = unsafe { GetForegroundWindow() };
+            if fg != self_hwnd && fg.0 != 0 {
+                self.stealth_focus.cover_hwnd = fg;
+            }
+            self.self_topmost_applied = true;
+        }
+
+        // --- Global Hotkey: toggle WinHider visibility ---
+        if self.hotkey_receiver.try_recv().is_ok() {
+            unsafe {
+                let fg = GetForegroundWindow();
+                if fg == self_hwnd {
+                    // Already focused -> minimize/hide
+                    let _ = ShowWindow(self_hwnd, SW_MINIMIZE);
+                } else {
+                    // Not focused -> show and bring to front
+                    let _ = ShowWindow(self_hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(self_hwnd);
+                    let _ = set_always_on_top(self_hwnd, true); // re-apply after restore
+                }
+            }
+        }
+
+        // --- Stealth Focus: keep cover window looking active ---
+        self.update_stealth_focus(self_hwnd);
 
         // --- 1. Background Logic ---
         if let Ok(elapsed) = SystemTime::now().duration_since(self.last_refresh) {
@@ -367,6 +516,7 @@ impl eframe::App for WinHiderApp {
                     if let Some(old) = self.windows.iter().find(|o| o.hwnd == w.hwnd) {
                         w.is_taskbar_hidden = old.is_taskbar_hidden;
                         w.is_capture_hidden = old.is_capture_hidden;
+                        w.is_always_on_top = old.is_always_on_top;
                     } else {
                         // Auto-hide new windows if they match the list
                         if self.should_auto_hide(&w.title) {
@@ -465,6 +615,28 @@ impl eframe::App for WinHiderApp {
             }
         }
 
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::P)) {
+            if !self.selected_window_idx.is_empty() {
+                let mut success_count = 0;
+                for &selected_hwnd in &self.selected_window_idx {
+                    if let Some(window) = self.windows.iter_mut().find(|w| w.hwnd == selected_hwnd) {
+                        let pin = !window.is_always_on_top;
+                        if set_always_on_top(window.hwnd, pin).is_ok() {
+                            window.is_always_on_top = pin;
+                            success_count += 1;
+                        }
+                    }
+                }
+                if success_count > 0 {
+                    self.status_msg = format!("Ctrl+P: Toggled pin for {} windows", success_count);
+                } else {
+                    self.status_msg = "Ctrl+P: Failed to toggle pin".to_string();
+                }
+            } else {
+                self.status_msg = "Ctrl+P: No windows selected".to_string();
+            }
+        }
+
         // --- 3. MENU BAR ---
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -491,25 +663,36 @@ impl eframe::App for WinHiderApp {
 
                 ui.menu_button("Settings", |ui| {
                     if ui.checkbox(&mut self.enable_auto_update, "Enable Auto-Updates").changed() {
-                        let settings = AppSettings { 
-                            enable_auto_update: self.enable_auto_update,
-                            preview_quality: self.preview_quality,
-                        };
-                        let _ = save_settings(&settings);
+                        let _ = save_settings(&self.current_settings());
                     }
-                    
+
+                    ui.separator();
+
+                    if ui.checkbox(&mut self.global_hotkey_enabled, "Enable Focus Hotkey (`)").changed() {
+                        if self.global_hotkey_enabled {
+                            // Start hotkey thread
+                            let (hk_tx, hk_rx) = crossbeam_channel::bounded(1);
+                            let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+                            start_hotkey_thread(self.global_hotkey_vk, hk_tx, shutdown_rx);
+                            self.hotkey_receiver = hk_rx;
+                            self.hotkey_shutdown_sender = Some(shutdown_tx);
+                        } else {
+                            // Stop hotkey thread
+                            if let Some(sender) = self.hotkey_shutdown_sender.take() {
+                                let _ = sender.send(());
+                            }
+                        }
+                        let _ = save_settings(&self.current_settings());
+                    }
+
                     ui.separator();
                     ui.label(egui::RichText::new("Preview Quality").strong());
-                    
+
                     let quality_options = [(1, "Low (Fastest)"), (2, "Medium (Balanced)"), (3, "High (Best)")];
                     for (value, label) in quality_options.iter() {
                         if ui.selectable_value(&mut self.preview_quality, *value, *label).changed() {
-                            let settings = AppSettings { 
-                                enable_auto_update: self.enable_auto_update,
-                                preview_quality: self.preview_quality,
-                            };
-                            let _ = save_settings(&settings);
-                            self.start_capture_session();  // Restart to apply new quality
+                            let _ = save_settings(&self.current_settings());
+                            self.start_capture_session();
                         }
                     }
                 });
@@ -634,7 +817,7 @@ impl eframe::App for WinHiderApp {
 
             ui.add_space(5.0);
             ui.label(egui::RichText::new(&self.status_msg).color(egui::Color32::LIGHT_BLUE));
-            ui.label(egui::RichText::new("Hotkeys: Ctrl+S=Toggle Capture, Ctrl+T=Toggle Taskbar (select windows first, Ctrl+click for multi-select)").small().color(egui::Color32::GRAY));
+            ui.label(egui::RichText::new("Hotkeys: Ctrl+S=Toggle Capture, Ctrl+T=Toggle Taskbar, Ctrl+P=Toggle Pin (select windows first, Ctrl+click for multi-select)").small().color(egui::Color32::GRAY));
             ui.separator();
 
             egui::ScrollArea::vertical()
@@ -682,7 +865,11 @@ impl eframe::App for WinHiderApp {
                                 );
 
                                 // 3. Render Selectable Label with Mixed Text
-                                if ui.selectable_label(is_selected, job).clicked() {
+                                let sel_resp = ui.selectable_label(is_selected, job);
+                                if sel_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                }
+                                if sel_resp.clicked() {
                                     // Handle Multi-selection (Ctrl+Click) vs Single Selection
                                     if ui.input(|i| i.modifiers.ctrl) {
                                         if is_selected {
@@ -708,7 +895,11 @@ impl eframe::App for WinHiderApp {
                             });
 
                             ui.horizontal(|ui| {
-                                if ui.checkbox(&mut window.is_taskbar_hidden, "Hide Taskbar").changed() {
+                                let tb_resp = ui.checkbox(&mut window.is_taskbar_hidden, "Hide Taskbar");
+                                if tb_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                }
+                                if tb_resp.changed() {
                                     if let Err(e) = set_taskbar_visibility_external(window.hwnd, window.is_taskbar_hidden) {
                                         self.status_msg = format!("Error: {}", e);
                                         window.is_taskbar_hidden = !window.is_taskbar_hidden;
@@ -717,7 +908,11 @@ impl eframe::App for WinHiderApp {
 
                                 ui.separator();
 
-                                if ui.checkbox(&mut window.is_capture_hidden, "Hide Capture").changed() {
+                                let cap_resp = ui.checkbox(&mut window.is_capture_hidden, "Hide Capture");
+                                if cap_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                }
+                                if cap_resp.changed() {
                                     let action = if window.is_capture_hidden {
                                         InjectionAction::HideCapture
                                     } else {
@@ -728,6 +923,22 @@ impl eframe::App for WinHiderApp {
                                         Err(e) => {
                                             self.status_msg = format!("Error: {}", e);
                                             window.is_capture_hidden = !window.is_capture_hidden;
+                                        }
+                                    }
+                                }
+
+                                ui.separator();
+
+                                let top_resp = ui.checkbox(&mut window.is_always_on_top, "Pin on Top");
+                                if top_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                                }
+                                if top_resp.changed() {
+                                    match set_always_on_top(window.hwnd, window.is_always_on_top) {
+                                        Ok(_) => self.status_msg = format!("Pin state updated: {}", window.title),
+                                        Err(e) => {
+                                            self.status_msg = format!("Error: {}", e);
+                                            window.is_always_on_top = !window.is_always_on_top;
                                         }
                                     }
                                 }
@@ -1195,12 +1406,18 @@ pub fn enumerate_windows(ctx: &egui::Context) -> Vec<AppWindow> {
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
 
             let (list, ctx) = &mut *(lparam.0 as *mut (Vec<AppWindow>, egui::Context));
+
+            // Detect initial topmost state
+            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            let is_topmost = (ex_style & WS_EX_TOPMOST.0) != 0;
+
             list.push(AppWindow {
                 hwnd,
                 pid,
                 title,
                 is_taskbar_hidden: false,
                 is_capture_hidden: false,
+                is_always_on_top: is_topmost,
                 icon_texture: get_window_icon(hwnd, ctx)
             });
             BOOL(1)
@@ -1246,13 +1463,17 @@ fn load_settings() -> AppSettings {
     let config_dir = get_config_dir();
     let file_path = config_dir.join("settings.json");
     match std::fs::read_to_string(file_path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| AppSettings { 
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| AppSettings {
             enable_auto_update: true,
             preview_quality: 2,
+            global_hotkey_enabled: true,
+            global_hotkey_vk: 0xC0,
         }),
-        Err(_) => AppSettings { 
+        Err(_) => AppSettings {
             enable_auto_update: true,
             preview_quality: 2,
+            global_hotkey_enabled: true,
+            global_hotkey_vk: 0xC0,
         },
     }
 }
@@ -1265,6 +1486,15 @@ fn save_settings(settings: &AppSettings) -> std::io::Result<()> {
 }
 
 impl WinHiderApp {
+    fn current_settings(&self) -> AppSettings {
+        AppSettings {
+            enable_auto_update: self.enable_auto_update,
+            preview_quality: self.preview_quality,
+            global_hotkey_enabled: self.global_hotkey_enabled,
+            global_hotkey_vk: self.global_hotkey_vk,
+        }
+    }
+
     fn should_auto_hide(&self, window_title: &str) -> bool {
         for app_name in &self.auto_hide_list {
             if !app_name.is_empty() && window_title.to_lowercase().contains(&app_name.to_lowercase()) {
@@ -1273,10 +1503,72 @@ impl WinHiderApp {
         }
         false
     }
+
+    fn update_stealth_focus(&mut self, self_hwnd: HWND) {
+        let fg_hwnd = unsafe { GetForegroundWindow() };
+        if fg_hwnd.0 == 0 {
+            return;
+        }
+
+        // Determine if the foreground window is "hidden" (capture-hidden)
+        let fg_is_hidden = if fg_hwnd == self_hwnd {
+            // WinHider itself counts as hidden only if self-hide-capture is on
+            self.self_hide_capture
+        } else {
+            self.windows.iter().any(|w| w.hwnd == fg_hwnd && w.is_capture_hidden)
+        };
+
+        if fg_is_hidden {
+            // A hidden window is foreground — activate stealth
+            let sf = &mut self.stealth_focus;
+
+            // Guard: cover must exist and still be a valid window
+            if sf.cover_hwnd.0 == 0 || !unsafe { IsWindow(sf.cover_hwnd) }.as_bool() {
+                sf.active = false;
+                sf.cover_hwnd = HWND(0);
+                return;
+            }
+
+            if !sf.active {
+                sf.active = true;
+                sf.heartbeat_counter = 0;
+                Self::send_stealth_overrides(sf);
+            } else {
+                sf.heartbeat_counter += 1;
+                if sf.heartbeat_counter >= 30 {
+                    sf.heartbeat_counter = 0;
+                    Self::send_stealth_overrides(sf);
+                }
+            }
+        } else {
+            // A normal visible window is foreground — update cover, deactivate stealth
+            if fg_hwnd != self_hwnd {
+                self.stealth_focus.cover_hwnd = fg_hwnd;
+            }
+            self.stealth_focus.active = false;
+        }
+    }
+
+    fn send_stealth_overrides(sf: &mut StealthFocusState) {
+        let cover = sf.cover_hwnd;
+        unsafe {
+            // Force cover window's title bar to draw as "active"
+            SendMessageW(cover, WM_NCACTIVATE, WPARAM(1), LPARAM(0));
+        }
+        // Force cover window's taskbar button to appear highlighted
+        if let Some(tbl) = sf.get_taskbar_list() {
+            unsafe {
+                let _ = tbl.ActivateTab(cover);
+            }
+        }
+    }
 }
 
 fn main() -> eframe::Result<()> {
-// Load Icon data for Window Titlebar (Reuse logic via utils)
+    // Initialize COM for ITaskbarList (stealth focus)
+    unsafe { let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED); }
+
+    // Load Icon data for Window Titlebar (Reuse logic via utils)
     // This now safely handles the ICO file without crashing
     let (icon_data, _) = load_app_icon();
 
